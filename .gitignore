@@ -1,0 +1,14 @@
+# Local machine-specific configuration (contains a per-machine NVAPI display ID)
+vrr-monitor.config.json
+
+# Generated monitoring logs
+*.csv
+
+# PowerShell/editor/OS noise
+*.ps1xml
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
