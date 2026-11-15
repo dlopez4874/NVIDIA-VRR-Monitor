@@ -1,0 +1,8 @@
+{
+  "DisplayId": 0,
+  "WindowSeconds": 5,
+  "UpdateIntervalMs": 500,
+  "PollIntervalMs": 1,
+  "StartupDelaySeconds": 3,
+  "LogFile": "vrr-monitor-log"
+}
