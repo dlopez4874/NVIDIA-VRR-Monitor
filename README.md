@@ -4,7 +4,11 @@
 
 A lightweight Windows PowerShell utility for OLED monitor owners who want a refresh-rate indicator without keeping an OSD or software overlay on the game display. It reads NVIDIA NVAPI presentation data and estimates the display refresh rate in a separate console window.
 
-The goal is deliberately simple: glance at a secondary display and see a refresh-rate number, much like the refresh-rate OSD indicators enthusiasts have used with variable-refresh-rate monitors for years.
+The goal is deliberately simple: glance at a secondary display and see a refresh-rate number, much like the refresh-rate OSD indicators enthusiasts have used with variable-refresh-rate monitors for years, but without having to display the OSD on the actual OLED panel. 
+
+## Screenshot
+
+![VRR Monitor running alongside a game](screenshots/demo.png)
 
 ## What's new in v0.2.1
 
