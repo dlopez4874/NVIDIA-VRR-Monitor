@@ -1,7 +1,65 @@
+﻿<#
+.SYNOPSIS
+Monitors an NVIDIA display's estimated refresh rate using NVAPI AdaptiveSync data.
+
+.DESCRIPTION
+Displays a compact refresh-rate estimate in Watch mode, or records periodic
+samples to a timestamped CSV in Log mode. The estimate is derived from NVAPI
+flip data and is not a direct measurement of the panel's timing controller.
+
+Use -VerboseOutput to show diagnostic details. Log mode writes one console
+line per display update (500 ms by default); these are periodic samples, not
+individual GPU flip events. The CSV always contains the full diagnostic data.
+
+.PARAMETER Mode
+Watch clears and refreshes the display in place. Log writes each periodic
+sample to the console and saves the collected diagnostic data to CSV.
+
+.PARAMETER VerboseOutput
+Shows rolling average, median, flip age, and NVAPI status information.
+
+.PARAMETER ConfigPath
+Path to the JSON configuration file. Defaults to vrr-monitor.config.json
+beside this script.
+
+.EXAMPLE
+.\VrrMonitor.ps1
+
+Starts the compact live refresh-rate display.
+
+.EXAMPLE
+.\VrrMonitor.ps1 -VerboseOutput
+
+Starts the live display with diagnostic details.
+
+.EXAMPLE
+.\VrrMonitor.ps1 -Mode Log
+
+Prints each periodic refresh-rate sample on a new line and saves a CSV.
+
+.EXAMPLE
+.\VrrMonitor.ps1 -Mode Log -VerboseOutput
+
+Prints detailed samples and saves a CSV containing the full diagnostic data.
+
+.EXAMPLE
+Get-Help .\VrrMonitor.ps1 -Detailed
+
+Displays the complete script help.
+
+.NOTES
+Requires 64-bit Windows PowerShell 5.1 or PowerShell 7, an NVIDIA GPU, and
+an NVIDIA display driver providing nvapi64.dll. Stop monitoring with Ctrl+C.
+#>
+
 [CmdletBinding()]
 param(
     [ValidateSet("Watch", "Log")]
     [string]$Mode = "Watch",
+
+    # Use -VerboseOutput for diagnostic details. PowerShell already reserves
+    # the common -Verbose parameter, so this avoids colliding with it.
+    [switch]$VerboseOutput,
 
     [string]$ConfigPath = (Join-Path $PSScriptRoot "vrr-monitor.config.json")
 )
@@ -217,7 +275,7 @@ if ($initStatus -ne 0) {
 }
 
 $initial = [NvApiVrrMonitorPortable]::Read($displayId)
-if ($initial.VrrStatus -ne 0 -and $initial.AdaptiveStatus -ne 0) {
+if ($initial.AdaptiveStatus -ne 0 -and $initial.VrrStatus -ne 0) {
     throw "Both NVAPI reads failed. Check DisplayId in the config file."
 }
 
@@ -247,7 +305,7 @@ function Get-VrrState {
     param($Sample)
 
     if ($Sample.VrrStatus -ne 0) {
-        return "VRR STATUS UNKNOWN"
+        return "UNKNOWN (NVAPI $($Sample.VrrStatus))"
     }
 
     $enabled = (($Sample.VrrFlags -band 0x01) -ne 0)
@@ -255,46 +313,45 @@ function Get-VrrState {
     $requested = (($Sample.VrrFlags -band 0x04) -ne 0)
     $displayMode = (($Sample.VrrFlags -band 0x10) -ne 0)
 
-    if ($enabled -and $requested -and $displayMode) {
-        return "VRR ENGAGED"
-    }
-    if ($requested -and $enabled) {
-        return "VRR REQUESTED; DISPLAY FLAG OFF"
-    }
-    if ($displayMode -and -not $requested) {
-        return "DISPLAY VRR FLAG SET; NOT REQUESTED"
-    }
-    if ($possible) {
-        return "VRR AVAILABLE; NOT ENGAGED"
-    }
-    return "VRR NOT AVAILABLE / INACTIVE"
+    if ($enabled -and $requested -and $displayMode) { return "ENGAGED" }
+    if ($requested -and $enabled) { return "REQUESTED; DISPLAY FLAG OFF" }
+    if ($displayMode -and -not $requested) { return "DISPLAY FLAG SET; NOT REQUESTED" }
+    if ($possible) { return "AVAILABLE; NOT ENGAGED" }
+    return "NOT AVAILABLE / INACTIVE"
+}
+
+function Get-NvApiStatusText {
+    param([int]$Status)
+    if ($Status -eq 0) { return "OK" }
+    if ($Status -eq -6) { return "ERROR (-6: NVIDIA_DEVICE_NOT_FOUND)" }
+    return "ERROR ($Status)"
 }
 
 Write-Host ""
 Write-Host "Display ID: $displayId"
 Write-Host "Mode: $Mode"
+Write-Host "Display: $(if ($VerboseOutput) { 'Verbose' } else { 'Standard' })"
 Write-Host "Switch to your game. Monitoring starts in $startupDelaySeconds seconds..."
 Start-Sleep -Seconds $startupDelaySeconds
 
 $timer = [System.Diagnostics.Stopwatch]::StartNew()
 $nextDisplay = 0.0
-$latestSample = $initial
 $logBase = [System.IO.Path]::GetFileNameWithoutExtension([string]$config.LogFile)
 $logPath = Join-Path $PSScriptRoot (
     "{0}-{1}.csv" -f $logBase, (Get-Date -Format "yyyyMMdd-HHmmss")
 )
 
+# A timestamp that has not changed for this long is treated as stale. This is
+# a presentation-data indicator, not proof that VRR has disengaged.
+$staleAfterMs = [math]::Max(1500, ($updateIntervalMs * 3))
+
 try {
     while ($true) {
         $sample = [NvApiVrrMonitorPortable]::Read($displayId)
         $now = $timer.Elapsed.TotalSeconds
-        $latestSample = $sample
 
-        # Record a new flip timestamp. FlipCount is treated as the number
-        # of refreshes represented by that flip interval; this is an estimate.
-        if ($sample.AdaptiveStatus -eq 0 -and
-            $sample.LastFlipTimeStamp -ne 0) {
-
+        # A valid AdaptiveSync read is required for rate estimation.
+        if ($sample.AdaptiveStatus -eq 0 -and $sample.LastFlipTimeStamp -ne 0) {
             if ($lastTimestamp -ne 0) {
                 if ($sample.LastFlipTimeStamp -gt $lastTimestamp) {
                     $dtMs = ($now - $lastFlipAt) * 1000.0
@@ -302,7 +359,6 @@ try {
 
                     if ($dtMs -gt 0 -and $dtMs -lt 1000 -and $refreshCount -gt 0) {
                         $estimatedHz = (1000.0 * $refreshCount) / $dtMs
-
                         $intervals.Add([pscustomobject]@{
                             At = $now
                             Hz = $estimatedHz
@@ -328,12 +384,6 @@ try {
         }
 
         if ($now -ge $nextDisplay) {
-            $state = Get-VrrState -Sample $sample
-
-            $enabled = (($sample.VrrFlags -band 0x01) -ne 0)
-            $requested = (($sample.VrrFlags -band 0x04) -ne 0)
-            $displayMode = (($sample.VrrFlags -band 0x10) -ne 0)
-
             $meanHz = $null
             $medianHz = $null
 
@@ -358,57 +408,115 @@ try {
                 $flipAgeMs = ($now - $lastFlipAt) * 1000.0
             }
 
-            if ($null -ne $meanHz) {
-                $rateText = "Avg {0:N1} Hz / Median {1:N1} Hz" -f $meanHz, $medianHz
+            $hasFreshFlip = ($null -ne $flipAgeMs -and $flipAgeMs -le $staleAfterMs)
+            $estimatedHz = $null
+            if ($hasFreshFlip -and $null -ne $meanHz) {
+                $estimatedHz = [math]::Round($meanHz, 0)
+            }
+
+            # A failed VRR Info query must never be represented as three false
+            # flags. Null means the state is unknown/not returned by the API.
+            $vrrState = Get-VrrState -Sample $sample
+            $vrrFlagsHex = $null
+            $enabled = $null
+            $possible = $null
+            $requested = $null
+            $displayMode = $null
+            if ($sample.VrrStatus -eq 0) {
+                $vrrFlagsHex = '0x{0:X2}' -f $sample.VrrFlags
+                $enabled = (($sample.VrrFlags -band 0x01) -ne 0)
+                $possible = (($sample.VrrFlags -band 0x02) -ne 0)
+                $requested = (($sample.VrrFlags -band 0x04) -ne 0)
+                $displayMode = (($sample.VrrFlags -band 0x10) -ne 0)
+            }
+
+            if ($null -ne $estimatedHz) {
+                $standardText = "{0} Hz" -f $estimatedHz
+            }
+            elseif ($null -eq $flipAgeMs) {
+                $standardText = "Waiting for data"
             }
             else {
-                $rateText = "Rate: waiting for flip data"
+                $standardText = "No recent flip data"
+            }
+
+            if ($null -ne $meanHz) {
+                $meanText = "{0:N1} Hz" -f $meanHz
+                $medianText = "{0:N1} Hz" -f $medianHz
+            }
+            else {
+                $meanText = "Waiting for data"
+                $medianText = "N/A"
             }
 
             if ($null -ne $flipAgeMs) {
-                $ageText = "Last flip {0:N0} ms ago" -f $flipAgeMs
+                $ageText = "{0:N0} ms ago" -f $flipAgeMs
             }
             else {
-                $ageText = "No flip data yet"
+                $ageText = "N/A"
             }
 
-            $line = "{0} | {1} | {2} | Enabled={3} Requested={4} DisplayMode={5}" -f `
-                $state, $rateText, $ageText, $enabled, $requested, $displayMode
+            $adaptiveText = Get-NvApiStatusText -Status $sample.AdaptiveStatus
+            $vrrText = Get-NvApiStatusText -Status $sample.VrrStatus
+            if ($null -eq $vrrFlagsHex) { $vrrFlagsText = "N/A" }
+            else { $vrrFlagsText = $vrrFlagsHex }
 
+            $verboseText = "Estimated: {0} | Average: {1} | Median: {2} | Last flip: {3} | AdaptiveSync: {4} | VRR Info: {5} | VRR state: {6} | VRR flags: {7}" -f `
+                $standardText, $meanText, $medianText, $ageText, $adaptiveText, $vrrText, $vrrState, $vrrFlagsText
+
+            # Standard mode is intentionally OSD-like: one value and no telemetry.
             if ($Mode -eq "Watch") {
-                # Clear and redraw instead of writing carriage-return-only lines.
-                # This avoids wrapped/stale text after resizing the terminal.
                 Clear-Host
-                Write-Host $line
-                Write-Host ""
-                Write-Host "Ctrl+C to stop. Five-second rolling window. Rate is an estimate."
+                if ($VerboseOutput) {
+                    Write-Host $verboseText
+                    Write-Host ""
+                    Write-Host "Ctrl+C to stop. Rolling window: $windowSeconds seconds. Refresh rate is an estimate."
+                }
+                else {
+                    Write-Host $standardText
+                }
             }
             else {
-                # Log mode intentionally writes a complete newline-terminated line.
                 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
-                Write-Host "[$stamp] $line"
+                if ($VerboseOutput) {
+                    Write-Host "[$stamp] $verboseText"
+                }
+                else {
+                    Write-Host $standardText
+                }
 
                 $meanLog = $null
                 $medianLog = $null
                 $flipAgeLog = $null
-
                 if ($null -ne $meanHz) { $meanLog = [math]::Round($meanHz, 2) }
                 if ($null -ne $medianHz) { $medianLog = [math]::Round($medianHz, 2) }
                 if ($null -ne $flipAgeMs) { $flipAgeLog = [math]::Round($flipAgeMs, 1) }
 
+                # CSV always captures the verbose/diagnostic data, even when
+                # the console is in Standard mode.
+                $viewModeText = "Standard"
+                if ($VerboseOutput) { $viewModeText = "Verbose" }
+
                 $logRows.Add([pscustomobject]@{
                     LocalTime = $stamp
                     ElapsedSeconds = [math]::Round($now, 3)
-                    VrrState = $state
-                    VrrFlagsHex = ('0x{0:X2}' -f $sample.VrrFlags)
-                    Enabled = $enabled
-                    Requested = $requested
-                    DisplayMode = $displayMode
+                    DisplayId = $displayId
+                    ViewMode = $viewModeText
+                    EstimatedHz = $estimatedHz
                     MeanHz = $meanLog
                     MedianHz = $medianLog
                     FlipAgeMs = $flipAgeLog
-                    FlipCount = $sample.LastFlipRefreshCount
+                    LastFlipRefreshCount = $sample.LastFlipRefreshCount
+                    LastFlipTimeStamp = $sample.LastFlipTimeStamp
+                    MaxFrameInterval = $sample.MaxFrameInterval
+                    AdaptiveFlagsHex = ('0x{0:X2}' -f $sample.AdaptiveFlags)
                     AdaptiveStatus = $sample.AdaptiveStatus
+                    VrrState = $vrrState
+                    VrrFlagsHex = $vrrFlagsHex
+                    Enabled = $enabled
+                    Possible = $possible
+                    Requested = $requested
+                    DisplayMode = $displayMode
                     VrrStatus = $sample.VrrStatus
                 })
             }
